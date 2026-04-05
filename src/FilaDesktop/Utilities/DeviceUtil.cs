@@ -15,7 +15,6 @@ public static class DeviceUtil
 
     public static bool FindFilaFolder(MediaDevice device)
     {
-        using var _ = device;
         device.Connect();
         foreach (var root in device.GetDirectories("\\"))
         {
@@ -30,7 +29,6 @@ public static class DeviceUtil
 
     public static string PullMobileKey(MediaDevice device)
     {
-        using var _ = device;
         device.Connect();
         var path = "\\FILA\\MOBILE.KEY";
         using var stream = device.OpenRead(path);
@@ -40,7 +38,6 @@ public static class DeviceUtil
 
     public static void PushKey(MediaDevice device, byte[] data)
     {
-        using var _ = device;
         device.Connect();
         using var ms = new MemoryStream(data);
         device.UploadFile(ms, "\\FILA\\KEYS.FILA", overwrite: true);
