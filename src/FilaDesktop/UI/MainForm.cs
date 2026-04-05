@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using MediaDevices;
@@ -25,6 +26,8 @@ public sealed class MainForm : Form
     private readonly VaultUtil _vault;
     private readonly IndexerUtil _indexer;
     private readonly string _masterKey;
+    private readonly SemaphoreSlim _updateGate = new(1, 1);
+    private CancellationTokenSource? _autoUpdateCts;
 
     public MainForm()
     {
@@ -81,6 +84,7 @@ public sealed class MainForm : Form
         _tracker.DevicesChanged += (_, devices) => BeginInvoke(() => RefreshGrid(devices));
         _scanButton.Click += async (_, _) => await ScanAsync();
         _updateButton.Click += async (_, _) => await UpdateSelectedDeviceAsync();
+        _autoUpdateCheck.CheckedChanged += (_, _) => ToggleAutoUpdate();
         _deviceGrid.SelectionChanged += (_, _) => UpdateUpdateButtonState();
     }
 
@@ -133,8 +137,14 @@ public sealed class MainForm : Form
             return Task.CompletedTask;
         }
 
-        return Task.Run(() =>
+        return UpdateDeviceAsync(serial, deviceName);
+    }
+
+    private Task UpdateDeviceAsync(string serial, string? deviceName)
+    {
+        return Task.Run(async () =>
         {
+            await _updateGate.WaitAsync().ConfigureAwait(false);
             try
             {
                 // 1) Resolve selected serial against currently connected devices.
@@ -147,31 +157,25 @@ public sealed class MainForm : Form
                     return;
                 }
 
-                // 2) Pull mobile key from device.
-                var mobilePublicKeyPem = DeviceUtil.PullMobileKey(connectedDevice);
-
-                // 3) Resolve latest vault key.
-                var dailyKey = _vault.GetLatest();
-                if (string.IsNullOrWhiteSpace(dailyKey))
+                using (connectedDevice)
                 {
-                    Log($"Update aborted for '{deviceName ?? serial}' ({serial}): no key is available in vault.");
-                    return;
+                    // 2) Pull mobile key from device.
+                    var mobilePublicKeyPem = DeviceUtil.PullMobileKey(connectedDevice);
+
+                    // 3) Resolve latest vault key.
+                    var dailyKey = _vault.GetLatest();
+                    if (string.IsNullOrWhiteSpace(dailyKey))
+                    {
+                        Log($"Update aborted for '{deviceName ?? serial}' ({serial}): no key is available in vault.");
+                        return;
+                    }
+
+                    // 4) Build encrypted payload.
+                    var payload = CryptoUtil.GenerateMobileEnvelope(mobilePublicKeyPem, dailyKey);
+
+                    // 5) Push payload to FILA/KEYS.FILA.
+                    DeviceUtil.PushKey(connectedDevice, payload);
                 }
-
-                // 4) Build encrypted payload.
-                var payload = CryptoUtil.GenerateMobileEnvelope(mobilePublicKeyPem, dailyKey);
-
-                // 5) Push payload to FILA/KEYS.FILA using a fresh connected instance.
-                var targetForPush = DeviceUtil.ListDevices()
-                    .FirstOrDefault(d => string.Equals(GetDeviceSerial(d), serial, StringComparison.OrdinalIgnoreCase));
-
-                if (targetForPush is null)
-                {
-                    Log($"Update failed for '{deviceName ?? serial}' ({serial}): device disconnected before push.");
-                    return;
-                }
-
-                DeviceUtil.PushKey(targetForPush, payload);
 
                 // 6) Mark and log success on UI thread.
                 BeginInvoke(() =>
@@ -185,7 +189,62 @@ public sealed class MainForm : Form
                 // 7) Log failure details while keeping UI responsive.
                 Log($"Update failed for '{deviceName ?? serial}' ({serial}): {ex.Message}");
             }
+            finally
+            {
+                _updateGate.Release();
+            }
         });
+    }
+
+    private void ToggleAutoUpdate()
+    {
+        if (_autoUpdateCheck.Checked)
+        {
+            _autoUpdateCts?.Cancel();
+            _autoUpdateCts?.Dispose();
+            _autoUpdateCts = new CancellationTokenSource();
+            Log("Auto-update enabled.");
+            _ = Task.Run(() => RunAutoUpdateLoopAsync(_autoUpdateCts.Token));
+            return;
+        }
+
+        _autoUpdateCts?.Cancel();
+        _autoUpdateCts?.Dispose();
+        _autoUpdateCts = null;
+        Log("Auto-update disabled.");
+    }
+
+    private async Task RunAutoUpdateLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                await _tracker.RefreshAsync().ConfigureAwait(false);
+
+                var readyDevice = _tracker.Snapshot()
+                    .Where(d => d.State == DeviceState.Ready && !d.InCooldown)
+                    .OrderBy(d => d.DeviceName, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+
+                if (readyDevice is null)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+                    continue;
+                }
+
+                await UpdateDeviceAsync(readyDevice.SerialId, readyDevice.DeviceName).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                Log($"Auto-update loop error: {ex.Message}");
+                await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+            }
+        }
     }
 
     private static string? GetDeviceSerial(MediaDevice device)
@@ -248,6 +307,9 @@ public sealed class MainForm : Form
     {
         if (disposing)
         {
+            _autoUpdateCts?.Cancel();
+            _autoUpdateCts?.Dispose();
+            _updateGate.Dispose();
             _tracker.Dispose();
         }
 

@@ -12,3 +12,22 @@
 - Implemented full `DeviceTrackerService.RefreshAsync` poll cycle using `DeviceUtil.ListDevices()`, stable serial derivation, FILA/MOBILE.KEY state evaluation, and delayed pruning after enumeration.
 - Preserved UPDATED cooldown semantics by carrying forward `Updated` state when `InCooldown` is true.
 - Adjusted refresh update path to batch `DevicesChanged` notifications (single emit per refresh cycle) while retaining immediate emits for `Upsert`/`MarkUpdated` outside refresh.
+- Fixed index import correctness bug in `IndexerUtil.Scan`: decrypted `DDD-...` keys are now mapped to a computed date derived from the day-of-year token instead of forcing everything into `DateTime.UtcNow`.
+- Added nearest-year resolution (`year-1/year/year+1` by closest distance) so imports around New Year are assigned to the most likely calendar date.
+- Added unit tests (`IndexerUtilTests`) for distinct date mapping and invalid day-prefix rejection to prevent regressions.
+- Attempted required formatter/lint/build/test commands (`dotnet format`, `dotnet build`, `dotnet test`) but environment still lacks .NET SDK (`dotnet: command not found`), so verification remains pending on a machine with .NET installed.
+- Fixed issue #2 by serializing `DeviceTrackerService.RefreshAsync` with `SemaphoreSlim`, eliminating overlap races from concurrent WMI and timer triggers.
+- `RefreshAsync` now uses an async gate (`WaitAsync`/`Release`) and keeps the existing batched notification pattern by suppressing in-loop emits.
+- Re-ran required validation commands after this change; `dotnet format`, `dotnet build`, and `dotnet test` are still blocked in this container (`dotnet: command not found`).
+- Fixed issue #3 by moving master-key fallback persistence to HKCU (`SOFTWARE\\FilaDesktop\\MachineGuid`) so non-admin users can persist identity safely.
+- Kept backward compatibility by reading legacy machine fallback (`HKLM\\...\\ShellIcons\\MachineGuid`) before creating a user-hive value.
+- Added guarded registry read/write helpers that swallow authorization/security exceptions and preserve runtime continuity.
+- Post-change validation commands were attempted again and still fail in this environment because the .NET SDK is missing (`dotnet: command not found`).
+- Fixed issue #4 by implementing the `Auto-Update` checkbox behavior in `MainForm` with a cancellable background loop and READY-device selection logic.
+- Added `_updateGate` (`SemaphoreSlim`) in `MainForm` so manual updates and auto updates cannot run simultaneously.
+- Added explicit auto-update enable/disable logging and disposal-time cancellation for predictable shutdown.
+- Formatter/build/test commands were attempted after the auto-update change and still could not run due to missing .NET SDK in the environment (`dotnet: command not found`).
+- Fixed issue #5 by changing `DeviceUtil` methods to stop disposing caller-owned `MediaDevice` instances.
+- Simplified `MainForm.UpdateDeviceAsync` to keep a single device handle alive for pull and push, then dispose explicitly at the caller level.
+- This removes a fragile dependency on re-enumerating devices between pull/push and aligns API ownership with expected helper semantics.
+- Post-change formatter/build/test attempts still fail in this container because `dotnet` is unavailable.

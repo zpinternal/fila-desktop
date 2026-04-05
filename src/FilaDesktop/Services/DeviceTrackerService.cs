@@ -16,6 +16,7 @@ public sealed class DeviceTrackerService : IDisposable
 {
     private readonly ConcurrentDictionary<string, TrackedDevice> _cache = new();
     private readonly object _eventGate = new();
+    private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly Timer _fallbackTimer;
     private readonly ManagementEventWatcher? _insertWatcher;
     private readonly ManagementEventWatcher? _removeWatcher;
@@ -54,50 +55,57 @@ public sealed class DeviceTrackerService : IDisposable
         }
     }
 
-    public Task RefreshAsync()
+    public async Task RefreshAsync()
     {
-        var connectedSerials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        _suppressEvents = true;
+        await _refreshGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            foreach (var device in DeviceUtil.ListDevices())
+            var connectedSerials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _suppressEvents = true;
+            try
             {
-                using var _ = device;
-
-                var serial = GetStableSerialId(device);
-                connectedSerials.Add(serial);
-
-                var existing = _cache.TryGetValue(serial, out var tracked) ? tracked : null;
-                if (existing is not null && existing.State == DeviceState.Updated && existing.InCooldown)
+                foreach (var device in DeviceUtil.ListDevices())
                 {
+                    using var _ = device;
+
+                    var serial = GetStableSerialId(device);
+                    connectedSerials.Add(serial);
+
+                    var existing = _cache.TryGetValue(serial, out var tracked) ? tracked : null;
+                    if (existing is not null && existing.State == DeviceState.Updated && existing.InCooldown)
+                    {
+                        Upsert(new TrackedDevice
+                        {
+                            DeviceName = ResolveDeviceName(device, serial),
+                            SerialId = serial,
+                            State = DeviceState.Updated,
+                            LastUpdatedUtc = existing.LastUpdatedUtc
+                        });
+                        continue;
+                    }
+
+                    var nextState = ResolveState(device);
                     Upsert(new TrackedDevice
                     {
                         DeviceName = ResolveDeviceName(device, serial),
                         SerialId = serial,
-                        State = DeviceState.Updated,
-                        LastUpdatedUtc = existing.LastUpdatedUtc
+                        State = nextState,
+                        LastUpdatedUtc = nextState == DeviceState.Updated ? existing?.LastUpdatedUtc : null
                     });
-                    continue;
                 }
-
-                var nextState = ResolveState(device);
-                Upsert(new TrackedDevice
-                {
-                    DeviceName = ResolveDeviceName(device, serial),
-                    SerialId = serial,
-                    State = nextState,
-                    LastUpdatedUtc = nextState == DeviceState.Updated ? existing?.LastUpdatedUtc : null
-                });
             }
+            finally
+            {
+                _suppressEvents = false;
+            }
+
+            PruneDisconnectedDevices(connectedSerials);
+            EmitDevicesChanged();
         }
         finally
         {
-            _suppressEvents = false;
+            _refreshGate.Release();
         }
-
-        PruneDisconnectedDevices(connectedSerials);
-        EmitDevicesChanged();
-        return Task.CompletedTask;
     }
 
     public IReadOnlyCollection<TrackedDevice> Snapshot() => _cache.Values.ToArray();
@@ -139,6 +147,7 @@ public sealed class DeviceTrackerService : IDisposable
     public void Dispose()
     {
         _fallbackTimer.Dispose();
+        _refreshGate.Dispose();
         _insertWatcher?.Dispose();
         _removeWatcher?.Dispose();
     }
