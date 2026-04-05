@@ -3,18 +3,23 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Management;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using FilaDesktop.Models;
+using FilaDesktop.Utilities;
+using MediaDevices;
 
 namespace FilaDesktop.Services;
 
 public sealed class DeviceTrackerService : IDisposable
 {
     private readonly ConcurrentDictionary<string, TrackedDevice> _cache = new();
+    private readonly object _eventGate = new();
     private readonly Timer _fallbackTimer;
     private readonly ManagementEventWatcher? _insertWatcher;
     private readonly ManagementEventWatcher? _removeWatcher;
+    private bool _suppressEvents;
 
     public event EventHandler<IReadOnlyCollection<TrackedDevice>>? DevicesChanged;
 
@@ -51,9 +56,47 @@ public sealed class DeviceTrackerService : IDisposable
 
     public Task RefreshAsync()
     {
-        // Placeholder for real DeviceUtil polling. This keeps state machine behavior isolated and testable.
-        PruneDisconnectedDevices(Array.Empty<string>());
-        DevicesChanged?.Invoke(this, _cache.Values.ToArray());
+        var connectedSerials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _suppressEvents = true;
+        try
+        {
+            foreach (var device in DeviceUtil.ListDevices())
+            {
+                using var _ = device;
+
+                var serial = GetStableSerialId(device);
+                connectedSerials.Add(serial);
+
+                var existing = _cache.TryGetValue(serial, out var tracked) ? tracked : null;
+                if (existing is not null && existing.State == DeviceState.Updated && existing.InCooldown)
+                {
+                    Upsert(new TrackedDevice
+                    {
+                        DeviceName = ResolveDeviceName(device, serial),
+                        SerialId = serial,
+                        State = DeviceState.Updated,
+                        LastUpdatedUtc = existing.LastUpdatedUtc
+                    });
+                    continue;
+                }
+
+                var nextState = ResolveState(device);
+                Upsert(new TrackedDevice
+                {
+                    DeviceName = ResolveDeviceName(device, serial),
+                    SerialId = serial,
+                    State = nextState,
+                    LastUpdatedUtc = nextState == DeviceState.Updated ? existing?.LastUpdatedUtc : null
+                });
+            }
+        }
+        finally
+        {
+            _suppressEvents = false;
+        }
+
+        PruneDisconnectedDevices(connectedSerials);
+        EmitDevicesChanged();
         return Task.CompletedTask;
     }
 
@@ -62,7 +105,10 @@ public sealed class DeviceTrackerService : IDisposable
     public void Upsert(TrackedDevice device)
     {
         _cache[device.SerialId] = device;
-        DevicesChanged?.Invoke(this, _cache.Values.ToArray());
+        if (!_suppressEvents)
+        {
+            EmitDevicesChanged();
+        }
     }
 
     public void MarkUpdated(string serial)
@@ -71,7 +117,10 @@ public sealed class DeviceTrackerService : IDisposable
         {
             existing.State = DeviceState.Updated;
             existing.LastUpdatedUtc = DateTimeOffset.UtcNow;
-            DevicesChanged?.Invoke(this, _cache.Values.ToArray());
+            if (!_suppressEvents)
+            {
+                EmitDevicesChanged();
+            }
         }
     }
 
@@ -92,5 +141,113 @@ public sealed class DeviceTrackerService : IDisposable
         _fallbackTimer.Dispose();
         _insertWatcher?.Dispose();
         _removeWatcher?.Dispose();
+    }
+
+    private DeviceState ResolveState(MediaDevice device)
+    {
+        try
+        {
+            device.Connect();
+
+            var hasFilaFolder = HasFilaFolder(device);
+            if (!hasFilaFolder)
+            {
+                return DeviceState.FilaNotFound;
+            }
+
+            var hasMobileKey = HasMobileKey(device);
+            return hasMobileKey ? DeviceState.Ready : DeviceState.Outdated;
+        }
+        catch
+        {
+            return DeviceState.FilaNotFound;
+        }
+    }
+
+    private static bool HasFilaFolder(MediaDevice device)
+    {
+        foreach (var root in device.GetDirectories("\\"))
+        {
+            if (string.Equals(System.IO.Path.GetFileName(root.TrimEnd('\\')), "FILA", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasMobileKey(MediaDevice device)
+    {
+        var fileExistsMethod = device.GetType().GetMethod("FileExists", new[] { typeof(string) });
+        if (fileExistsMethod is not null && fileExistsMethod.ReturnType == typeof(bool))
+        {
+            try
+            {
+                return (bool)fileExistsMethod.Invoke(device, new object[] { "\\FILA\\MOBILE.KEY" })!;
+            }
+            catch
+            {
+                // Fall through to OpenRead probe.
+            }
+        }
+
+        try
+        {
+            using var stream = device.OpenRead("\\FILA\\MOBILE.KEY");
+            return stream is not null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string ResolveDeviceName(MediaDevice device, string fallback)
+    {
+        var friendly = ReadStringProperty(device, "FriendlyName");
+        return string.IsNullOrWhiteSpace(friendly) ? fallback : friendly;
+    }
+
+    private static string GetStableSerialId(MediaDevice device)
+    {
+        var primary = ReadStringProperty(device, "SerialNumber");
+        if (!string.IsNullOrWhiteSpace(primary))
+        {
+            return primary;
+        }
+
+        var secondary = ReadStringProperty(device, "DeviceId");
+        if (!string.IsNullOrWhiteSpace(secondary))
+        {
+            return secondary;
+        }
+
+        var tertiary = ReadStringProperty(device, "FriendlyName");
+        if (!string.IsNullOrWhiteSpace(tertiary))
+        {
+            return tertiary;
+        }
+
+        var manufacturer = ReadStringProperty(device, "Manufacturer");
+        var model = ReadStringProperty(device, "Model");
+        var compound = $"{manufacturer}|{model}";
+        return string.IsNullOrWhiteSpace(compound.Replace("|", string.Empty, StringComparison.Ordinal))
+            ? "UNKNOWN-DEVICE"
+            : compound;
+    }
+
+    private static string? ReadStringProperty(object instance, string propertyName)
+    {
+        var property = instance.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        return property?.GetValue(instance)?.ToString()?.Trim();
+    }
+
+    private void EmitDevicesChanged()
+    {
+        lock (_eventGate)
+        {
+            DevicesChanged?.Invoke(this, _cache.Values.ToArray());
+        }
     }
 }
