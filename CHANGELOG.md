@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 - 2026-04-05 14:52 (GMT+3)
+- Replaced `DeviceTrackerService.RefreshAsync` placeholder logic with a full device poll cycle backed by `DeviceUtil.ListDevices()`.
+- Added per-device serial mapping, FILA folder / `MOBILE.KEY` checks, and state assignment for READY, OUTDATED, and FILA NOT FOUND.
+- Preserved UPDATED cooldown behavior during refresh and batched refresh notifications to emit `DevicesChanged` once per cycle.
+
 ## 0.2.0 - 2026-04-05 11:47 (GMT+3)
 - Implemented initial native C# FILA desktop client scaffolding from spec.
 - Added WinForms UI with status, device grid, scan/update controls, and logging console.
