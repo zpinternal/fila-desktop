@@ -1,8 +1,8 @@
 # Backlog
 
 ## P0
-- Implement full `DeviceTrackerService.RefreshAsync` wiring to `DeviceUtil` and real device state transitions.
 - Add end-to-end tests with mocked MTP abstraction to cover READY/OUTDATED/FILA NOT FOUND/UPDATED transitions.
+- Add a dedicated lock/semaphore around `RefreshAsync` to prevent overlapping timer + WMI refresh races.
 
 ## P1
 - Implement auto-update worker that consumes READY devices while respecting cooldown.
