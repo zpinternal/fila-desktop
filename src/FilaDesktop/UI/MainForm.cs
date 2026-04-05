@@ -1,8 +1,10 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using MediaDevices;
 using FilaDesktop.Models;
 using FilaDesktop.Services;
 using FilaDesktop.Utilities;
@@ -112,20 +114,93 @@ public sealed class MainForm : Form
 
     private Task UpdateSelectedDeviceAsync()
     {
-        if (_deviceGrid.SelectedRows.Count == 0)
-        {
-            return Task.CompletedTask;
-        }
+        string? serial = null;
+        string? deviceName = null;
 
-        var serial = _deviceGrid.SelectedRows[0].Cells["SerialId"].Value?.ToString();
+        Invoke(() =>
+        {
+            if (_deviceGrid.SelectedRows.Count == 0)
+            {
+                return;
+            }
+
+            serial = _deviceGrid.SelectedRows[0].Cells["SerialId"].Value?.ToString();
+            deviceName = _deviceGrid.SelectedRows[0].Cells["DeviceName"].Value?.ToString();
+        });
+
         if (string.IsNullOrWhiteSpace(serial))
         {
             return Task.CompletedTask;
         }
 
-        _tracker.MarkUpdated(serial);
-        Log($"Updated {serial} successfully.");
-        return Task.CompletedTask;
+        return Task.Run(() =>
+        {
+            try
+            {
+                // 1) Resolve selected serial against currently connected devices.
+                var connectedDevice = DeviceUtil.ListDevices()
+                    .FirstOrDefault(d => string.Equals(GetDeviceSerial(d), serial, StringComparison.OrdinalIgnoreCase));
+
+                if (connectedDevice is null)
+                {
+                    Log($"Update skipped. Device '{deviceName ?? serial}' ({serial}) is no longer connected.");
+                    return;
+                }
+
+                // 2) Pull mobile key from device.
+                var mobilePublicKeyPem = DeviceUtil.PullMobileKey(connectedDevice);
+
+                // 3) Resolve latest vault key.
+                var dailyKey = _vault.GetLatest();
+                if (string.IsNullOrWhiteSpace(dailyKey))
+                {
+                    Log($"Update aborted for '{deviceName ?? serial}' ({serial}): no key is available in vault.");
+                    return;
+                }
+
+                // 4) Build encrypted payload.
+                var payload = CryptoUtil.GenerateMobileEnvelope(mobilePublicKeyPem, dailyKey);
+
+                // 5) Push payload to FILA/KEYS.FILA using a fresh connected instance.
+                var targetForPush = DeviceUtil.ListDevices()
+                    .FirstOrDefault(d => string.Equals(GetDeviceSerial(d), serial, StringComparison.OrdinalIgnoreCase));
+
+                if (targetForPush is null)
+                {
+                    Log($"Update failed for '{deviceName ?? serial}' ({serial}): device disconnected before push.");
+                    return;
+                }
+
+                DeviceUtil.PushKey(targetForPush, payload);
+
+                // 6) Mark and log success on UI thread.
+                BeginInvoke(() =>
+                {
+                    _tracker.MarkUpdated(serial);
+                    Log($"Updated '{deviceName ?? serial}' ({serial}) successfully.");
+                });
+            }
+            catch (Exception ex)
+            {
+                // 7) Log failure details while keeping UI responsive.
+                Log($"Update failed for '{deviceName ?? serial}' ({serial}): {ex.Message}");
+            }
+        });
+    }
+
+    private static string? GetDeviceSerial(MediaDevice device)
+    {
+        return GetStringProperty(device, "SerialNumber")
+               ?? GetStringProperty(device, "Serial")
+               ?? GetStringProperty(device, "Id");
+    }
+
+    private static string? GetStringProperty(object target, string propertyName)
+    {
+        var value = target.GetType()
+            .GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance)
+            ?.GetValue(target);
+        return value?.ToString();
     }
 
     private void RefreshGrid(System.Collections.Generic.IReadOnlyCollection<TrackedDevice> devices)
