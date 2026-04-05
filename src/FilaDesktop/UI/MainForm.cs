@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -123,9 +124,26 @@ public sealed class MainForm : Form
             return Task.CompletedTask;
         }
 
-        _tracker.MarkUpdated(serial);
-        Log($"Updated {serial} successfully.");
-        return Task.CompletedTask;
+        var latestKey = _vault.GetLatest();
+        if (string.IsNullOrWhiteSpace(latestKey))
+        {
+            Log("Skipped update because vault is empty.");
+            return Task.CompletedTask;
+        }
+
+        return Task.Run(() =>
+        {
+            try
+            {
+                DeviceUtil.PushKey(serial, Encoding.UTF8.GetBytes(latestKey));
+                _tracker.MarkUpdated(serial);
+                Log($"Updated {serial} successfully.");
+            }
+            catch (Exception ex)
+            {
+                Log($"Update failed for {serial}: {ex.Message}");
+            }
+        });
     }
 
     private void RefreshGrid(System.Collections.Generic.IReadOnlyCollection<TrackedDevice> devices)

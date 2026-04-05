@@ -6,6 +6,7 @@ using System.Management;
 using System.Threading;
 using System.Threading.Tasks;
 using FilaDesktop.Models;
+using FilaDesktop.Utilities;
 
 namespace FilaDesktop.Services;
 
@@ -51,10 +52,50 @@ public sealed class DeviceTrackerService : IDisposable
 
     public Task RefreshAsync()
     {
-        // Placeholder for real DeviceUtil polling. This keeps state machine behavior isolated and testable.
-        PruneDisconnectedDevices(Array.Empty<string>());
+        var devices = DeviceUtil.ListDevices();
+        var connectedSerials = devices
+            .Select(d => d.SerialId)
+            .Where(serial => !string.IsNullOrWhiteSpace(serial))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        PruneDisconnectedDevices(connectedSerials);
+
+        foreach (var device in devices)
+        {
+            if (string.IsNullOrWhiteSpace(device.SerialId))
+            {
+                continue;
+            }
+
+            var state = ResolveState(device.SerialId);
+            var existing = _cache.TryGetValue(device.SerialId, out var cached) ? cached : null;
+
+            _cache[device.SerialId] = new TrackedDevice
+            {
+                DeviceName = device.DeviceName,
+                SerialId = device.SerialId,
+                State = existing?.State == DeviceState.Updated && state == DeviceState.Ready
+                    ? DeviceState.Updated
+                    : state,
+                LastUpdatedUtc = existing?.LastUpdatedUtc
+            };
+        }
+
         DevicesChanged?.Invoke(this, _cache.Values.ToArray());
         return Task.CompletedTask;
+    }
+
+    private static DeviceState ResolveState(string serialId)
+    {
+        try
+        {
+            return DeviceUtil.FindFilaFolder(serialId) ? DeviceState.Ready : DeviceState.FilaNotFound;
+        }
+        catch
+        {
+            return DeviceState.FilaNotFound;
+        }
     }
 
     public IReadOnlyCollection<TrackedDevice> Snapshot() => _cache.Values.ToArray();
