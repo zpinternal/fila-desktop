@@ -2,6 +2,7 @@
 
 ## P0
 - Add end-to-end tests with mocked MTP abstraction to cover READY/OUTDATED/FILA NOT FOUND/UPDATED transitions.
+- Refactor `DeviceUtil` ownership semantics so `PullMobileKey`/`PushKey` do not force disposal of caller-provided `MediaDevice` instances, allowing a true single-connection update pipeline.
 - Add a dedicated lock/semaphore around `RefreshAsync` to prevent overlapping timer + WMI refresh races.
 
 ## P1

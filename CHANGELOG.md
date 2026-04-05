@@ -1,6 +1,9 @@
 # Changelog
 
 ## 0.2.1 - 2026-04-05 14:52 (GMT+3)
+- Replaced `UpdateSelectedDeviceAsync` placeholder with a real end-to-end update sequence using `DeviceUtil.PullMobileKey`, `VaultUtil.GetLatest`, `CryptoUtil.GenerateMobileEnvelope`, and `DeviceUtil.PushKey`.
+- Added safe background execution with UI-thread marshaling (`Invoke`/`BeginInvoke`) for selection reads, tracker state updates, and logs.
+- Added resilient failure logging when the device disconnects, vault key is missing, or an exception occurs, preventing UI crashes.
 - Replaced `DeviceTrackerService.RefreshAsync` placeholder logic with a full device poll cycle backed by `DeviceUtil.ListDevices()`.
 - Added per-device serial mapping, FILA folder / `MOBILE.KEY` checks, and state assignment for READY, OUTDATED, and FILA NOT FOUND.
 - Preserved UPDATED cooldown behavior during refresh and batched refresh notifications to emit `DevicesChanged` once per cycle.
